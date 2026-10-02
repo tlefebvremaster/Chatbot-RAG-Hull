@@ -79,13 +79,20 @@ Une base de données classique ne sait pas chercher "le vecteur le plus proche".
 ### C'est quoi, simplement
 Quand tu poses une question : on la transforme en vecteur, on retrouve les passages du livre les plus pertinents, on les donne à Claude qui rédige la réponse avec les sources.
 
-### Comment on l'a fait (version avancée)
-1. **Interface chat** avec **mémoire** (Postgres) → permet les questions de suivi ("et pour l'option américaine ?").
-2. **Recherche hybride** — deux méthodes combinées :
-   - **Sémantique** (vecteurs) : trouve par le sens.
-   - **Mots-clés** (full-text Postgres) : trouve les termes exacts (noms propres, sigles, formules nommées).
-3. **Reranking (Cohere)** : on récupère 20 passages candidats, puis un modèle spécialisé les **reclasse par pertinence** et ne garde que les **5 meilleurs**.
-4. **Génération (Claude)** : lit ces passages et rédige une réponse structurée, **en citant la page**, sans inventer.
+### Comment on l'a fait (pipeline explicite, nœud par nœud)
+Chaque étape est un **nœud visible** (pas de « sous-nœud » boîte noire), dans cet ordre :
+1. **Interface chat** avec **mémoire** (table `chat_turns` en SQL) → questions de suivi ("et pour l'option américaine ?").
+2. **Embedding de la question** (HTTP → Gemini) : la question devient un vecteur, avec **le même modèle** qu'à l'indexation.
+3. **Recherche hybride** — deux requêtes SQL combinées :
+   - **Sémantique** (vecteurs, opérateur `<=>`) : trouve par le sens → 20 passages.
+   - **Mots-clés** (full-text Postgres) : trouve les termes exacts (noms propres, sigles, formules nommées) → 8 passages.
+4. **Fusion + dédoublonnage** des passages (nœud Code).
+5. **Reranking (HTTP → Cohere)** : un modèle spécialisé **reclasse** ces candidats par pertinence et ne garde que les **5 meilleurs**.
+6. **Augmentation** (nœud Code) : on **construit à la main le prompt** = consigne système + historique + les 5 extraits (avec leur page) + la question.
+7. **Génération (nœud Claude)** : lit ce prompt et rédige la réponse **en citant la page**, sans inventer.
+8. **Sauvegarde** de l'échange dans `chat_turns` (SQL) pour la mémoire.
+
+**Pourquoi un pipeline explicite ?** À la demande du jury, on a supprimé le nœud « AI Agent » (qui faisait recherche + génération en boîte noire). Avantage : on **voit et contrôle chaque étape**, et on peut en **ajouter** (ex. un garde-fou "absent du livre", une traduction FR→EN de la question) à l'endroit voulu. L'indexation, elle, garde ses sous-nœuds car ils garantissent automatiquement le numéro de page (voir plus bas).
 
 ### Justification des choix
 
@@ -119,8 +126,9 @@ C'est le cœur du RAG : une réponse **vérifiable** et **fiable**. On l'a test�
 | Passages récupérés | 20 | large filet pour ne rien rater |
 | Passages gardés après rerank | 5 | précision : seuls les meilleurs vont au LLM |
 | Recherche | hybride (sémantique + mots-clés) | couvre sens ET termes exacts |
-| LLM de réponse | Claude | synthèse + gratuit (crédits n8n) |
-| Mémoire | Postgres chat memory | questions de suivi |
+| LLM de réponse | Claude `claude-sonnet-5` | synthèse + gratuit (crédits n8n) |
+| Mémoire | Table SQL `chat_turns` | questions de suivi |
+| Architecture de réponse | explicite (sans sous-nœuds) | contrôle total + ajout d'étapes possible |
 
 ---
 

@@ -1,80 +1,131 @@
 # Architecture | Chatbot RAG — Options, Futures and Other Derivatives (Hull)
 
-Traduction technique du [cahier des charges](CAHIER-DES-CHARGES.md). Chaque nœud cité ci-dessous a été vérifié en interrogeant directement le registre de nœuds de l'instance n8n cloud (via le MCP) — pas de supposition sur leur existence ou leurs paramètres.
+Traduction technique du [cahier des charges](CAHIER-DES-CHARGES.md). Chaque nœud cité ci-dessous existe réellement dans les workflows n8n livrés ([`rag-indexation.json`](rag-indexation.json) et [`rag-chatbot-explicite.json`](rag-chatbot-explicite.json)).
+
+> **Version finale : pipeline explicite.** À la demande du jury, la phase de réponse n'utilise **aucun « sous-nœud »** (pas de nœud AI Agent « boîte noire »). Chaque étape — embedding, recherche, rerank, augmentation, génération, mémoire — est un **nœud visible et modifiable**, pour un contrôle total et la possibilité d'ajouter des étapes.
 
 ## 1. Vue d'ensemble
 
-Deux workflows séparés, qui ne se chevauchent qu'au niveau de la base Supabase partagée :
+Deux workflows séparés, qui ne se partagent que la base Postgres (Supabase).
 
 ```
 WORKFLOW 1 — Indexation (une seule fois, manuel)
-┌──────────────────┐     ┌──────────────────────────────────────┐
-│ Formulaire n8n     │────▶│ Supabase Vector Store (mode: insert)  │
-│ (upload du PDF)    │     │  ├─ embedding: Google Gemini           │
-└──────────────────┘     │  └─ documentLoader: Default Data Loader│
-                           │       (lit le PDF binaire, découpe     │
-                           │        par page, puis par chunks)      │
-                           └──────────────────┬─────────────────────┘
-                                               ▼
-                                     Table Supabase "documents"
-                                     (contenu + embedding + page)
+┌──────────────────┐     ┌────────────────────────────────────────────┐
+│ Formulaire n8n     │────▶│ Postgres PGVector (mode: insert)            │
+│ (upload du PDF)    │     │  ├─ embedding : Google Gemini                │
+└──────────────────┘     │  ├─ documentLoader : Chargeur PDF (par page)│
+                           │  └─ textSplitter : Recursive (1000 / 200)   │
+                           └────────────────────┬───────────────────────┘
+                                                 ▼
+                                       Table Postgres "documents"
+                                       (text + embedding 3072 + metadata.loc.pageNumber)
 
-WORKFLOW 2 — Question / Réponse (à chaque appel)
-┌──────────┐     ┌────────────────────────────────────────────┐     ┌──────────────┐
-│ Webhook   │────▶│ AI Agent                                    │────▶│ Réponse webhook│
-│ (POST)    │     │  ├─ model: Anthropic Chat Model (Claude)     │     │ (JSON direct)  │
-└──────────┘     │  └─ tools: Supabase Vector Store              │     └──────────────┘
-                   │        (mode: retrieve-as-tool, top 4)        │
-                   │        └─ embedding: Google Gemini            │
-                   └────────────────────────────────────────────┘
+WORKFLOW 2 — Question / Réponse (chaîne explicite, à chaque message)
+┌───────────────┐   ┌──────────────────┐   ┌──────────────────────────┐
+│ Chat Trigger   │──▶│ Préparer entrée    │──▶│ Embedding question (Gemini)│  HTTP
+│ (public, mémo) │   │ (Set: question,    │   │  → vecteur 3072           │
+└───────────────┘   │  session_id)       │   └───────────┬──────────────┘
+                     └──────────────────┘               ▼
+                                              ┌──────────────────┐
+                                              │ Vecteur vers SQL  │ (Code)
+                                              └────────┬──────────┘
+                                   ┌───────────────────┴───────────────────┐
+                                   ▼                                       ▼
+                        ┌────────────────────┐              ┌────────────────────────┐
+                        │ Recherche vectorielle│  (Postgres)  │ Recherche mots-cles     │ (Postgres)
+                        │ embedding <=> vec, 20 │              │ to_tsvector/ts_query, 8 │
+                        └──────────┬───────────┘              └───────────┬────────────┘
+                                   └───────────────┬──────────────────────┘
+                                                   ▼
+                                        ┌────────────────────┐
+                                        │ Fusionner resultats │ (Merge)
+                                        └──────────┬──────────┘
+                                                   ▼
+                                        ┌────────────────────┐
+                                        │ Agreger passages    │ (Code: dédoublonnage)
+                                        └──────────┬──────────┘
+                                                   ▼
+                                        ┌────────────────────┐
+                                        │ Rerank (Cohere)     │  HTTP → rerank-v3.5, top 5
+                                        └──────────┬──────────┘
+                                                   ▼
+                                        ┌────────────────────┐
+                                        │ Top passages        │ (Code: contexte + [page X])
+                                        └──────────┬──────────┘
+                                                   ▼
+                                        ┌────────────────────┐
+                                        │ Lire historique     │ (Postgres: chat_turns, 5 derniers)
+                                        └──────────┬──────────┘
+                                                   ▼
+                                        ┌──────────────────────────┐
+                                        │ Construire prompt augmente│ (Code: système + extraits + historique)
+                                        └──────────┬───────────────┘
+                                                   ▼
+                                        ┌────────────────────┐
+                                        │ Generer reponse     │  Anthropic Claude (claude-sonnet-5)
+                                        └──────────┬──────────┘
+                                                   ▼
+                                        ┌────────────────────┐   ┌────────────────────┐
+                                        │ Sauver historique   │──▶│ Reponse (sortie chat)│
+                                        │ (Postgres INSERT)   │   │ (Set: output)        │
+                                        └────────────────────┘   └────────────────────┘
 ```
 
 ## 2. Traçabilité exigence → choix technique
 
 | Exigence (cahier des charges) | Choix technique | Pourquoi |
 |---|---|---|
-| Déclenché via webhook/API, pas d'interface dédiée | Nœud **Webhook** (POST) en entrée du workflow 2, `responseMode: lastNode` | Renvoie directement la sortie de l'AI Agent comme réponse HTTP — aucun nœud de réponse supplémentaire nécessaire |
-| Indexation une seule fois, ce livre uniquement | Workflow 1 séparé, déclenché par un **formulaire n8n** avec un champ fichier, pas de planification | Le Manual Trigger ne peut pas recevoir de fichier ; le formulaire est le seul moyen simple de faire parvenir le PDF à n8n cloud (qui n'a pas accès à ton disque local) |
-| Réponse = texte libre + citation chapitre/page | Consigne système explicite sur l'AI Agent + découpage du PDF **par page** (`splitPages: true`) dans le Data Loader | Chaque passage retrouvé porte son numéro de page en métadonnée, que l'agent peut citer |
-| Base vectorielle = Supabase | Nœud natif **Supabase Vector Store** (`@n8n/n8n-nodes-langchain.vectorStoreSupabase`), confirmé disponible, modes insert + retrieve-as-tool | Choix déjà fait dans le cahier des charges, confirmé supporté nativement |
-| LLM = Anthropic Claude | **Anthropic Chat Model** (`lmChatAnthropic`), modèle `claude-sonnet-5` | Choix déjà fait ; branché comme "cerveau" de l'AI Agent |
-| Budget 0€, clé Anthropic "à récupérer" | **Crédits Gateway** de l'instance n8n cloud, qui couvrent `anthropicApi` ET `googlePalmApi` (Gemini, pour les embeddings) | Découverte en vérifiant le MCP n8n : l'instance propose des identifiants managés gratuits pour ces deux fournisseurs — pas besoin de créer ta propre clé Anthropic pour ce volume ponctuel |
-| Quota gratuit Supabase à respecter | Un seul livre, indexé une fois → volume de vecteurs borné et prévisible | Pas de mécanisme de ré-indexation qui ferait grossir la base indéfiniment |
-| Usage ponctuel démo/soutenance | Architecture simple, sans file d'attente ni limitation de débit | Le volume ne justifie pas de complexité supplémentaire |
-| Gestion d'erreur non prioritaire | Comportement par défaut de n8n conservé, aucun retry/alerting ajouté | Conforme à la décision explicite du cahier des charges |
+| Interface de chat avec mémoire | Nœud **Chat Trigger** (`public`, `responseMode: lastNode`) + table mémoire `chat_turns` lue/écrite en SQL | Permet les questions de suivi ("et pour l'option américaine ?") sans dépendre d'un sous-nœud de mémoire |
+| Suppression des « sous-nœuds » (demande du jury) | Chaîne **explicite** : HTTP (embedding, rerank), Postgres (recherche, mémoire), Code (fusion, augmentation), nœud Anthropic | Chaque étape est visible et modifiable ; on peut insérer une étape (garde-fou, traduction…) n'importe où |
+| Indexation une seule fois, ce livre uniquement | Workflow 1 séparé, déclenché par un **formulaire n8n** (champ fichier) | Le formulaire est le moyen simple d'envoyer le PDF à n8n cloud (pas d'accès au disque local) |
+| Réponse = texte libre + citation chapitre/page | Prompt système explicite (nœud Code *Construire prompt augmente*) + découpage **par page** (`splitPages: true`) à l'indexation | Chaque passage retrouvé porte son `metadata.loc.pageNumber`, injecté dans le contexte sous la forme `[page X]` et cité par Claude |
+| Base vectorielle = Supabase | **Postgres + pgvector** via une connexion Postgres (Session pooler Supabase) | Le cours impose une connexion Postgres ; pgvector ajoute la recherche de proximité (`<=>`) |
+| Qualité de recherche | **Recherche hybride** : vectorielle (sens) + full-text (`to_tsvector`/`plainto_tsquery`, termes exacts), puis **rerank Cohere** | La vectorielle rate parfois un terme technique précis ; les mots-clés le rattrapent ; le rerank ne garde que les 5 plus pertinents |
+| LLM = Anthropic Claude | Nœud **Anthropic** (`claude-sonnet-5`), `simplify: false`, `maxTokens: 1500`, système injecté en expression | Choix du cahier des charges ; branché en fin de chaîne explicite |
+| Budget 0€ | **Crédits Gateway** n8n cloud (Anthropic) + clé **Gemini** gratuite (embeddings) + **Cohere** gratuit (rerank) + Supabase gratuit | Aucun coût additionnel pour un usage ponctuel de démo |
+| Quota gratuit Supabase à respecter | Un seul livre, indexé une fois → volume de vecteurs borné (5020 chunks) | Pas de ré-indexation récurrente qui ferait grossir la base |
 
 ## 3. Logique détaillée
 
-### Workflow 1 — Indexation
-1. Le formulaire n8n (champ type "file", PDF uniquement) reçoit le livre.
-2. Le nœud Supabase Vector Store en mode `insert` reçoit ce fichier.
-3. Son sous-nœud **Default Data Loader** est configuré en `dataType: binary`, `loader: pdfLoader`, `options.splitPages: true` — il extrait le texte du PDF et crée un document par page, avec le numéro de page en métadonnée.
-4. Chaque page est ensuite re-découpée en chunks plus petits via un sous-nœud **Recursive Character Text Splitter** (`chunkSize` ~1000, `chunkOverlap` ~200) — nécessaire car une page de manuel académique est souvent trop longue pour un seul chunk d'embedding efficace.
-5. Son sous-nœud **embedding** (Google Gemini, modèle `models/gemini-embedding-001`) vectorise chaque chunk.
-6. Le résultat est inséré dans la table Supabase configurée (voir §4, prérequis).
+### Workflow 1 — Indexation (`rag-indexation.json`)
+1. Le **formulaire n8n** (champ type `file`, PDF) reçoit le livre.
+2. Le nœud **Postgres PGVector** (`mode: insert`, table `documents`) orchestre l'insertion.
+3. Son sous-nœud **Chargeur PDF (par page)** (`dataType: binary`, `loader: pdfLoader`, `splitPages: true`) crée **un document par page**, avec le numéro de page en métadonnée.
+4. Son sous-nœud **Decoupage en chunks** (Recursive Character Text Splitter, `chunkSize` ~1000, `chunkOverlap` 200) re-découpe chaque page.
+5. Son sous-nœud **Embeddings Google Gemini** (`gemini-embedding-001`) vectorise chaque chunk (3072 dim).
+6. Résultat inséré dans la table `documents`.
 
-### Workflow 2 — Question/Réponse
-1. Le Webhook reçoit un POST avec la question (ex. `{"question": "..."}`) — à adapter au nom de champ exact une fois branché.
-2. L'**AI Agent** reçoit cette question (`promptType: define`, texte = expression pointant vers le corps de la requête).
-3. Son `systemMessage` lui donne deux consignes fermes : répondre en langage naturel ET toujours citer la page/le chapitre d'origine du passage utilisé.
-4. L'agent dispose d'un seul outil : le **Supabase Vector Store en mode `retrieve-as-tool`**, avec une description claire ("recherche des passages du livre Hull sur les produits dérivés") et `topK: 4` (les 4 passages les plus pertinents).
-5. L'agent décide d'appeler cet outil, reçoit les passages + leurs métadonnées (page), compose la réponse.
-6. Le Webhook renvoie directement `{{ $json.output }}` au client appelant (`responseMode: lastNode`).
+> **Pourquoi l'indexation garde ses sous-nœuds ?** Le Chargeur PDF intégré tamponne automatiquement et de façon fiable le `pageNumber` de chaque chunk. Le refaire en explicite (via *Extract from File*) aplatirait le PDF et ferait perdre les frontières de pages — donc les citations. L'esprit de la demande (contrôle, ajout d'étapes) concerne la phase de réponse, pas ce découpage linéaire.
+
+### Workflow 2 — Question / Réponse (`rag-chatbot-explicite.json`)
+1. **Chat RAG Hull** (Chat Trigger) reçoit le message et l'identifiant de session.
+2. **Préparer entrée** (Set) extrait `question` et `session_id`.
+3. **Embedding question (Gemini)** (HTTP POST) transforme la question en vecteur 3072 — *même modèle que l'indexation*, condition pour que les vecteurs soient comparables.
+4. **Vecteur vers SQL** (Code) formate le vecteur (`[v1,v2,…]`) et nettoie les mots-clés.
+5. **Recherche vectorielle** (Postgres) : `ORDER BY embedding <=> vec` → 20 passages par le sens. **Recherche mots-cles** (Postgres) : `to_tsvector @@ plainto_tsquery` → 8 passages par termes exacts.
+6. **Fusionner resultats** (Merge) + **Agreger passages** (Code, dédoublonnage par texte).
+7. **Rerank (Cohere)** (HTTP POST, `rerank-v3.5`, `top_n: 5`) reclasse les candidats par pertinence réelle.
+8. **Top passages** (Code) reconstruit les 5 meilleurs passages avec leur page → bloc de contexte `[page X] …`.
+9. **Lire historique** (Postgres) récupère les 5 derniers échanges de la session (`alwaysOutputData: true`).
+10. **Construire prompt augmente** (Code) assemble le message système (réponds en français, uniquement d'après les extraits, cite la page, n'invente pas) + historique + extraits + question. **C'est l'étape d'augmentation.**
+11. **Generer reponse** (Anthropic, `claude-sonnet-5`) rédige la réponse sourcée.
+12. **Sauver historique** (Postgres INSERT, dollar-quoting `$q$…$q$` / `$a$…$a$` pour gérer les virgules/apostrophes) + **Reponse (sortie chat)** (Set) renvoie la réponse.
 
 ## 4. Modèle de données
 
-### Table Supabase (prérequis à créer avant le premier import)
-Le nœud Supabase Vector Store ne crée pas la table tout seul — il faut exécuter au préalable, dans l'éditeur SQL Supabase, le script standard d'intégration pgvector (extension `vector`, table avec colonnes `id`, `content`, `metadata` (jsonb), `embedding` (vector), et la fonction `match_documents`). C'est la procédure officielle documentée par Supabase pour l'intégration LangChain — à exécuter une fois, avant d'activer le Workflow 1.
+Voir [`schema.sql`](schema.sql).
 
-### Métadonnées par chunk
-`pageNumber` (numéro de page dans le PDF source, ajouté automatiquement par le Data Loader avec `splitPages: true`) — c'est ce champ que l'agent doit citer dans ses réponses.
+- **`documents`** : `id`, `text`, `metadata` (jsonb, contient `loc.pageNumber`), `embedding` (vector **3072**). Créée automatiquement par le nœud PGVector au premier insert (dimension déduite du modèle).
+- **Index full-text** : `documents_text_fts` (GIN sur `to_tsvector('english', text)`) — alimente la recherche par mots-clés.
+- **Pas d'index ANN** sur `embedding` : pgvector n'indexe pas au-delà de 2000 dimensions (ici 3072) → balayage exact, suffisant à l'échelle d'un livre.
+- **`chat_turns`** : `id`, `session_id`, `question`, `answer`, `created_at` — la mémoire de conversation.
 
 ## 5. Risques & limites
 
-| Risque | Impact | À vérifier/faire |
+| Risque | Impact | À vérifier / faire |
 |---|---|---|
-| Taille du PDF (36,3 Mo) envoyée via un formulaire web | Risque de dépassement d'une limite de taille de payload sur n8n cloud | Tester l'upload réel avant de compter dessus pour la soutenance ; si ça bloque, scinder le PDF en plusieurs parties ou l'héberger ailleurs et le récupérer par URL |
-| Crédits Gateway (Anthropic + Gemini) à quota limité, montant exact inconnu | Pourrait s'épuiser avant/pendant la soutenance si testé en boucle | Vérifier le solde réel dans l'interface n8n cloud avant la démo ; avoir en secours ta propre clé Anthropic si besoin |
-| Citation de page dépend du bon comportement du PDF Loader sur un PDF académique complexe (notes de bas de page, formules, mise en page 2 colonnes) | Les numéros de page ou le découpage pourraient être imprécis sur certaines sections | À vérifier concrètement après la première indexation, sur quelques questions tests |
-| Table/fonction Supabase non créées | Le Workflow 1 échoue dès la première insertion | Exécuter le script SQL pgvector de Supabase avant d'activer le workflow |
-| Qualité des réponses non testée sur du contenu technique (formules financières, notations mathématiques) | Les chunks de texte brut peuvent mal capturer des formules/tableaux | À évaluer après un premier test réel avec des questions types d'examen |
+| Taille du PDF (~36 Mo) via le formulaire | Dépassement possible de la limite d'upload n8n cloud | Tester l'upload réel avant la démo ; sinon scinder le PDF |
+| Crédits Gateway (Anthropic) + quotas Gemini/Cohere gratuits | Épuisement possible si testé en boucle | Vérifier les soldes avant la soutenance ; garder une clé de secours |
+| Citation de page dépend du PDF Loader sur un PDF académique (formules, 2 colonnes) | Numéros de page ou découpage imprécis sur certaines sections | Vérifié après la 1ère indexation sur des questions tests |
+| Pas d'index vectoriel (3072 dim) | Recherche plus lente si la base grossit beaucoup (plusieurs livres) | OK pour un livre ; réduire la dimension si passage à l'échelle |
+| Qualité sur contenu très technique (formules, notations) | Chunks de texte brut capturant mal certaines formules | Évalué sur des questions types d'examen |
