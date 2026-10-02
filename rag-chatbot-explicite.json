@@ -1,0 +1,155 @@
+{
+  "name": "RAG Hull - Pipeline explicite (sans sous-nœuds)",
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "connections": {
+    "Chat RAG Hull": { "main": [[{ "node": "Préparer entrée", "type": "main", "index": 0 }]] },
+    "Préparer entrée": { "main": [[{ "node": "Embedding question (Gemini)", "type": "main", "index": 0 }]] },
+    "Embedding question (Gemini)": { "main": [[{ "node": "Vecteur vers SQL", "type": "main", "index": 0 }]] },
+    "Vecteur vers SQL": { "main": [[{ "node": "Recherche vectorielle", "type": "main", "index": 0 }, { "node": "Recherche mots-cles", "type": "main", "index": 0 }]] },
+    "Recherche vectorielle": { "main": [[{ "node": "Fusionner resultats", "type": "main", "index": 0 }]] },
+    "Fusionner resultats": { "main": [[{ "node": "Agreger passages", "type": "main", "index": 0 }]] },
+    "Recherche mots-cles": { "main": [[{ "node": "Fusionner resultats", "type": "main", "index": 1 }]] },
+    "Agreger passages": { "main": [[{ "node": "Rerank (Cohere)", "type": "main", "index": 0 }]] },
+    "Rerank (Cohere)": { "main": [[{ "node": "Top passages", "type": "main", "index": 0 }]] },
+    "Top passages": { "main": [[{ "node": "Lire historique", "type": "main", "index": 0 }]] },
+    "Lire historique": { "main": [[{ "node": "Construire prompt augmente", "type": "main", "index": 0 }]] },
+    "Construire prompt augmente": { "main": [[{ "node": "Generer reponse", "type": "main", "index": 0 }]] },
+    "Generer reponse": { "main": [[{ "node": "Sauver historique", "type": "main", "index": 0 }]] },
+    "Sauver historique": { "main": [[{ "node": "Reponse (sortie chat)", "type": "main", "index": 0 }]] }
+  },
+  "nodes": [
+    {
+      "parameters": { "public": true, "initialMessages": "Bonjour ! Posez votre question sur le livre de John Hull.", "options": { "title": "RAG Hull (explicite)", "responseMode": "lastNode" } },
+      "id": "30ed96cf-2912-4186-bca4-0946f46797e6",
+      "name": "Chat RAG Hull",
+      "type": "@n8n/n8n-nodes-langchain.chatTrigger",
+      "typeVersion": 1.5,
+      "position": [0, 96],
+      "webhookId": "d7dc8264-1548-4549-a6d4-8b19051ec0a0"
+    },
+    {
+      "parameters": { "assignments": { "assignments": [{ "id": "q", "name": "question", "value": "={{ $json.chatInput }}", "type": "string" }, { "id": "s", "name": "session_id", "value": "={{ $json.sessionId }}", "type": "string" }] }, "options": {} },
+      "id": "fbae045f-7bd2-4f8e-b089-d784442cfe7d",
+      "name": "Préparer entrée",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [224, 96]
+    },
+    {
+      "parameters": { "method": "POST", "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:embedContent", "authentication": "predefinedCredentialType", "nodeCredentialType": "googlePalmApi", "sendBody": true, "specifyBody": "json", "jsonBody": "={ \"content\": { \"parts\": [ { \"text\": {{ JSON.stringify($json.question) }} } ] } }", "options": {} },
+      "id": "b5d845a7-5d85-4d30-a857-9e4260816a72",
+      "name": "Embedding question (Gemini)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [448, 96]
+    },
+    {
+      "parameters": { "jsCode": "const emb = $json.embedding.values;\nconst vec = '[' + emb.join(',') + ']';\nconst prep = $('Préparer entrée').item.json;\nconst keywords = String(prep.question).replace(/[,'\\\"]/g, ' ').trim();\nreturn [{ json: { vec, keywords, question: prep.question, session_id: prep.session_id } }];" },
+      "id": "66c40e60-cef8-4bfb-b105-96cf67c78e8e",
+      "name": "Vecteur vers SQL",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [976, 96]
+    },
+    {
+      "parameters": { "operation": "executeQuery", "query": "SELECT text, (metadata->'loc'->>'pageNumber') AS page, 1 - (embedding <=> '{{ $json.vec }}'::vector) AS score FROM documents ORDER BY embedding <=> '{{ $json.vec }}'::vector LIMIT 20", "options": {} },
+      "id": "a4032835-aa5a-460b-90c7-36e8d20d9f9e",
+      "name": "Recherche vectorielle",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [1200, 0]
+    },
+    {
+      "parameters": {},
+      "id": "8dfae61d-c9bd-45fa-b550-d92d9c05ff6c",
+      "name": "Fusionner resultats",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.2,
+      "position": [1424, 96]
+    },
+    {
+      "parameters": { "operation": "executeQuery", "query": "SELECT text, (metadata->'loc'->>'pageNumber') AS page, ts_rank(to_tsvector('english', text), plainto_tsquery('english', $1)) AS score FROM documents WHERE to_tsvector('english', text) @@ plainto_tsquery('english', $1) ORDER BY score DESC LIMIT 8", "options": { "queryReplacement": "={{ $json.keywords }}" } },
+      "id": "e8f30972-e029-4c2b-8463-39efa65f32cb",
+      "name": "Recherche mots-cles",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [1200, 192]
+    },
+    {
+      "parameters": { "jsCode": "const items = $input.all();\nconst seen = new Set();\nconst passages = [];\nfor (const it of items) {\n  const t = it.json.text;\n  if (!t || seen.has(t)) continue;\n  seen.add(t);\n  passages.push({ text: t, page: it.json.page });\n}\nconst documents = passages.map(p => p.text);\nconst prep = $('Préparer entrée').item.json;\nreturn [{ json: { passages, documents, question: prep.question, session_id: prep.session_id } }];" },
+      "id": "7f0b5d4a-cabd-410e-a211-e07611d9c68e",
+      "name": "Agreger passages",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1648, 96]
+    },
+    {
+      "parameters": { "method": "POST", "url": "https://api.cohere.com/v2/rerank", "authentication": "predefinedCredentialType", "nodeCredentialType": "cohereApi", "sendBody": true, "specifyBody": "json", "jsonBody": "={ \"model\": \"rerank-v3.5\", \"query\": {{ JSON.stringify($json.question) }}, \"documents\": {{ JSON.stringify($json.documents) }}, \"top_n\": 5 }", "options": {} },
+      "id": "6e3a95ab-9942-4e73-9805-b9aea329410c",
+      "name": "Rerank (Cohere)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.5,
+      "position": [1872, 96]
+    },
+    {
+      "parameters": { "jsCode": "const res = $json.results || [];\nconst agg = $('Agreger passages').item.json;\nconst passages = agg.passages;\nconst top = res.map(r => passages[r.index]).filter(Boolean).slice(0, 5);\nlet context = '';\nfor (const p of top) { context += '[page ' + (p.page || '?') + '] ' + p.text + '\\n\\n'; }\nreturn [{ json: { context, question: agg.question, session_id: agg.session_id } }];" },
+      "id": "4f8e0075-7d50-4843-80b7-937b9d4336b0",
+      "name": "Top passages",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2096, 96]
+    },
+    {
+      "parameters": { "operation": "executeQuery", "query": "SELECT question, answer FROM chat_turns WHERE session_id = $1 ORDER BY created_at DESC LIMIT 5", "options": { "queryReplacement": "={{ $('Top passages').item.json.session_id }}" } },
+      "id": "719554d2-1f9c-46c0-ae10-87aa21c81eec",
+      "name": "Lire historique",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [2016, 96],
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": { "jsCode": "const hist = $input.all().filter(i => i.json && i.json.question);\nconst top = $('Top passages').item.json;\nlet historyText = '';\nconst rows = hist.slice().reverse();\nfor (const h of rows) { historyText += 'Q: ' + h.json.question + '\\nR: ' + h.json.answer + '\\n'; }\nconst system = 'Tu es un assistant expert du livre Options, Futures and Other Derivatives de John Hull. Reponds en francais, uniquement a partir des EXTRAITS fournis. Cite toujours la page sous la forme (source : page X) et l extrait dont l information provient entre guillemets, accompagné d une traduction simplificatrice. Si l information n est pas dans les extraits, dis-le.';\nconst user = (historyText ? ('Historique:\\n' + historyText + '\\n') : '') + 'EXTRAITS DU LIVRE:\\n' + top.context + '\\nQUESTION: ' + top.question;\nreturn [{ json: { system, user, question: top.question, session_id: top.session_id } }];" },
+      "id": "efbe2826-3bad-4095-9cf9-a231db2a1baa",
+      "name": "Construire prompt augmente",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2240, 96]
+    },
+    {
+      "parameters": { "modelId": { "__rl": true, "mode": "list", "value": "claude-sonnet-5", "cachedResultName": "Claude Sonnet 5" }, "messages": { "values": [{ "content": "={{ $json.user }}" }] }, "simplify": false, "options": { "system": "={{ $json.system }}", "maxTokens": 1500 } },
+      "id": "319f7422-a5ef-4a71-834a-1e4e1887a057",
+      "name": "Generer reponse",
+      "type": "@n8n/n8n-nodes-langchain.anthropic",
+      "typeVersion": 1,
+      "position": [2464, 96]
+    },
+    {
+      "parameters": { "operation": "executeQuery", "query": "INSERT INTO chat_turns (session_id, question, answer) VALUES ('{{ $('Préparer entrée').item.json.session_id }}', $q${{ $('Préparer entrée').item.json.question }}$q$, $a${{ $('Generer reponse').item.json.content[0].text }}$a$)", "options": {} },
+      "id": "8b34aa51-4fcb-42c9-a930-ec8c72b70558",
+      "name": "Sauver historique",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [2688, 96]
+    },
+    {
+      "parameters": { "assignments": { "assignments": [{ "id": "o", "name": "output", "value": "={{ $('Generer reponse').item.json.content[0].text }}", "type": "string" }] }, "options": {} },
+      "id": "7cd91add-26a6-4a4f-9971-7774dee0a244",
+      "name": "Reponse (sortie chat)",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [2912, 96]
+    },
+    {
+      "parameters": { "content": "## Chatbot RAG explicite (sans sous-noeuds)\n\nChaque etape est un noeud visible et modifiable :\n1. Embedding de la question via HTTP (Gemini)\n2. Recherche vectorielle (SQL) + mots-cles (SQL) = hybride\n3. Fusion + rerank via HTTP (Cohere)\n4. Construction du prompt AUGMENTE (injection des extraits)\n5. Generation (Claude) + memoire lue/ecrite en SQL\n\nTable memoire : chat_turns. Extraits : table documents.", "color": 6 },
+      "id": "1bdeb9d6-6ff2-4332-b816-92bad2a5a5e6",
+      "name": "Sticky Note 9bcd7338",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [-320, 64]
+    }
+  ]
+}

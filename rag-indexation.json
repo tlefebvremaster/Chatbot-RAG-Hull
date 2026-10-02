@@ -1,0 +1,64 @@
+{
+  "name": "RAG Hull - 1. Indexation du livre (PGVector)",
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  },
+  "connections": {
+    "Upload du livre (PDF)": { "main": [[{ "node": "Postgres PGVector - Insertion", "type": "main", "index": 0 }]] },
+    "Embeddings Google Gemini": { "ai_embedding": [[{ "node": "Postgres PGVector - Insertion", "type": "ai_embedding", "index": 0 }]] },
+    "Chargeur PDF (par page)": { "ai_document": [[{ "node": "Postgres PGVector - Insertion", "type": "ai_document", "index": 0 }]] },
+    "Decoupage en chunks": { "ai_textSplitter": [[{ "node": "Chargeur PDF (par page)", "type": "ai_textSplitter", "index": 0 }]] }
+  },
+  "nodes": [
+    {
+      "parameters": { "formTitle": "Indexation RAG - Livre Hull", "formDescription": "Uploader le PDF du livre une seule fois pour le vectoriser dans Postgres (Supabase).", "formFields": { "values": [{ "fieldLabel": "Fichier PDF du livre", "fieldType": "file", "fieldName": "book_pdf", "multipleFiles": false, "acceptFileTypes": ".pdf", "requiredField": true }] }, "options": {} },
+      "id": "32aa403c-8173-4723-8dbf-40e960a51174",
+      "name": "Upload du livre (PDF)",
+      "type": "n8n-nodes-base.formTrigger",
+      "typeVersion": 2.6,
+      "position": [0, 208],
+      "webhookId": "786e6603-425b-46f3-8f7f-89394d28bfe3"
+    },
+    {
+      "parameters": { "mode": "insert", "tableName": "documents", "options": {} },
+      "id": "1c546e89-75cf-426e-baf9-bb169ec34f60",
+      "name": "Postgres PGVector - Insertion",
+      "type": "@n8n/n8n-nodes-langchain.vectorStorePGVector",
+      "typeVersion": 1.3,
+      "position": [224, 208]
+    },
+    {
+      "parameters": {},
+      "id": "3ec060dd-23ba-4aff-824f-30f037bab379",
+      "name": "Embeddings Google Gemini",
+      "type": "@n8n/n8n-nodes-langchain.embeddingsGoogleGemini",
+      "typeVersion": 1,
+      "position": [-48, 496]
+    },
+    {
+      "parameters": { "dataType": "binary", "loader": "pdfLoader", "textSplittingMode": "custom", "options": { "splitPages": true } },
+      "id": "6bc93a7b-e505-427a-b65a-cbf691d7fd2f",
+      "name": "Chargeur PDF (par page)",
+      "type": "@n8n/n8n-nodes-langchain.documentDefaultDataLoader",
+      "typeVersion": 1.1,
+      "position": [448, 400]
+    },
+    {
+      "parameters": { "chunkOverlap": 200, "options": {} },
+      "id": "e90ce1b1-4cb0-4c90-97fb-d559341fc0a6",
+      "name": "Decoupage en chunks",
+      "type": "@n8n/n8n-nodes-langchain.textSplitterRecursiveCharacterTextSplitter",
+      "typeVersion": 1,
+      "position": [576, 576]
+    },
+    {
+      "parameters": { "content": "## Workflow 1 - Indexation (a lancer UNE SEULE FOIS)\n\nUploade le PDF du livre Hull -> decoupe par page puis en chunks, vectorise via Gemini, insere dans Postgres (table documents) via PGVector.\n\n### Avant de lancer :\n1. Connexion Postgres (Session pooler Supabase) deja creee.\n2. Table documents + extension vector deja creees dans Supabase (vector 3072 = sortie Gemini).\n3. Embeddings Gemini : credits Gateway gratuits de n8n cloud.\n4. Lancer le formulaire, uploader le PDF.\n\n### Fragilite connue :\n- PDF de 36 Mo : verifier la limite de taille d upload de n8n cloud.\n- Verifier le decoupage sur PDF academique (formules, 2 colonnes) apres la 1ere indexation.", "color": 4 },
+      "id": "9c85bf23-033a-4ec3-998f-09109916acdb",
+      "name": "Sticky Note 491a7e4e",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [112, 624]
+    }
+  ]
+}
