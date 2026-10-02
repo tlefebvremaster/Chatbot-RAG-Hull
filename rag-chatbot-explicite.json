@@ -6,7 +6,10 @@
   },
   "connections": {
     "Chat RAG Hull": { "main": [[{ "node": "Préparer entrée", "type": "main", "index": 0 }]] },
-    "Préparer entrée": { "main": [[{ "node": "Embedding question (Gemini)", "type": "main", "index": 0 }]] },
+    "Préparer entrée": { "main": [[{ "node": "Historique (reformulation)", "type": "main", "index": 0 }]] },
+    "Historique (reformulation)": { "main": [[{ "node": "Reformuler la question", "type": "main", "index": 0 }]] },
+    "Reformuler la question": { "main": [[{ "node": "Requete de recherche", "type": "main", "index": 0 }]] },
+    "Requete de recherche": { "main": [[{ "node": "Embedding question (Gemini)", "type": "main", "index": 0 }]] },
     "Embedding question (Gemini)": { "main": [[{ "node": "Vecteur vers SQL", "type": "main", "index": 0 }]] },
     "Vecteur vers SQL": { "main": [[{ "node": "Recherche vectorielle", "type": "main", "index": 0 }, { "node": "Recherche mots-cles", "type": "main", "index": 0 }]] },
     "Recherche vectorielle": { "main": [[{ "node": "Fusionner resultats", "type": "main", "index": 0 }]] },
@@ -39,15 +42,40 @@
       "position": [224, 96]
     },
     {
-      "parameters": { "method": "POST", "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:embedContent", "authentication": "predefinedCredentialType", "nodeCredentialType": "googlePalmApi", "sendBody": true, "specifyBody": "json", "jsonBody": "={ \"content\": { \"parts\": [ { \"text\": {{ JSON.stringify($json.question) }} } ] } }", "options": {} },
+      "parameters": { "operation": "executeQuery", "query": "SELECT COALESCE(string_agg(t.q || ' / R: ' || t.a, ' || '), '') AS history FROM (SELECT question AS q, answer AS a FROM chat_turns WHERE session_id = $1 ORDER BY created_at DESC LIMIT 5) t", "options": { "queryReplacement": "={{ $('Préparer entrée').item.json.session_id }}" } },
+      "id": "aa11bb22-cc33-dd44-ee55-ff6677889900",
+      "name": "Historique (reformulation)",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.7,
+      "position": [224, 300]
+    },
+    {
+      "parameters": { "modelId": { "__rl": true, "mode": "list", "value": "claude-sonnet-5", "cachedResultName": "Claude Sonnet 5" }, "messages": { "values": [{ "content": "={{ ($json.history ? ('Historique des echanges precedents: ' + $json.history + '  ||  ') : '') + 'Question actuelle: ' + $('Préparer entrée').item.json.question }}" }] }, "simplify": false, "options": { "system": "Tu reecris la question de l'utilisateur en UNE SEULE requete de recherche, autonome et en ANGLAIS, destinee a chercher dans un manuel de finance en anglais (Hull, Options, Futures and Other Derivatives). Sers-toi de l'historique pour resoudre les references implicites (ex. 'et pour l'americaine ?' -> 'American option early exercise'). Conserve les termes techniques. Ne reponds QUE par la requete, sans guillemets ni explication.", "maxTokens": 150 } },
+      "id": "bb22cc33-dd44-ee55-ff66-778899001122",
+      "name": "Reformuler la question",
+      "type": "@n8n/n8n-nodes-langchain.anthropic",
+      "typeVersion": 1,
+      "position": [448, 300],
+      "executeOnce": true
+    },
+    {
+      "parameters": { "assignments": { "assignments": [{ "id": "sq", "name": "search_query", "value": "={{ $json.content[0].text.trim() }}", "type": "string" }, { "id": "q", "name": "question", "value": "={{ $('Préparer entrée').item.json.question }}", "type": "string" }, { "id": "s", "name": "session_id", "value": "={{ $('Préparer entrée').item.json.session_id }}", "type": "string" }] }, "options": {} },
+      "id": "cc33dd44-ee55-ff66-7788-990011223344",
+      "name": "Requete de recherche",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [672, 300]
+    },
+    {
+      "parameters": { "method": "POST", "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-001:embedContent", "authentication": "predefinedCredentialType", "nodeCredentialType": "googlePalmApi", "sendBody": true, "specifyBody": "json", "jsonBody": "={ \"content\": { \"parts\": [ { \"text\": {{ JSON.stringify($json.search_query) }} } ] } }", "options": {} },
       "id": "b5d845a7-5d85-4d30-a857-9e4260816a72",
       "name": "Embedding question (Gemini)",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.5,
-      "position": [448, 96]
+      "position": [896, 96]
     },
     {
-      "parameters": { "jsCode": "const emb = $json.embedding.values;\nconst vec = '[' + emb.join(',') + ']';\nconst prep = $('Préparer entrée').item.json;\nconst keywords = String(prep.question).replace(/[,'\\\"]/g, ' ').trim();\nreturn [{ json: { vec, keywords, question: prep.question, session_id: prep.session_id } }];" },
+      "parameters": { "jsCode": "const emb = $json.embedding.values;\nconst vec = '[' + emb.join(',') + ']';\nconst req = $('Requete de recherche').item.json;\nconst keywords = String(req.search_query).replace(/[,'\\\"]/g, ' ').trim();\nreturn [{ json: { vec, keywords, question: req.question, search_query: req.search_query, session_id: req.session_id } }];" },
       "id": "66c40e60-cef8-4bfb-b105-96cf67c78e8e",
       "name": "Vecteur vers SQL",
       "type": "n8n-nodes-base.code",
@@ -79,7 +107,7 @@
       "position": [1200, 192]
     },
     {
-      "parameters": { "jsCode": "const items = $input.all();\nconst seen = new Set();\nconst passages = [];\nfor (const it of items) {\n  const t = it.json.text;\n  if (!t || seen.has(t)) continue;\n  seen.add(t);\n  passages.push({ text: t, page: it.json.page });\n}\nconst documents = passages.map(p => p.text);\nconst prep = $('Préparer entrée').item.json;\nreturn [{ json: { passages, documents, question: prep.question, session_id: prep.session_id } }];" },
+      "parameters": { "jsCode": "const items = $input.all();\nconst seen = new Set();\nconst passages = [];\nfor (const it of items) {\n  const t = it.json.text;\n  if (!t || seen.has(t)) continue;\n  seen.add(t);\n  passages.push({ text: t, page: it.json.page });\n}\nconst documents = passages.map(p => p.text);\nconst v = $('Vecteur vers SQL').item.json;\nreturn [{ json: { passages, documents, question: v.question, search_query: v.search_query, session_id: v.session_id } }];" },
       "id": "7f0b5d4a-cabd-410e-a211-e07611d9c68e",
       "name": "Agreger passages",
       "type": "n8n-nodes-base.code",
@@ -87,7 +115,7 @@
       "position": [1648, 96]
     },
     {
-      "parameters": { "method": "POST", "url": "https://api.cohere.com/v2/rerank", "authentication": "predefinedCredentialType", "nodeCredentialType": "cohereApi", "sendBody": true, "specifyBody": "json", "jsonBody": "={ \"model\": \"rerank-v3.5\", \"query\": {{ JSON.stringify($json.question) }}, \"documents\": {{ JSON.stringify($json.documents) }}, \"top_n\": 5 }", "options": {} },
+      "parameters": { "method": "POST", "url": "https://api.cohere.com/v2/rerank", "authentication": "predefinedCredentialType", "nodeCredentialType": "cohereApi", "sendBody": true, "specifyBody": "json", "jsonBody": "={ \"model\": \"rerank-v3.5\", \"query\": {{ JSON.stringify($json.search_query) }}, \"documents\": {{ JSON.stringify($json.documents) }}, \"top_n\": 5 }", "options": {} },
       "id": "6e3a95ab-9942-4e73-9805-b9aea329410c",
       "name": "Rerank (Cohere)",
       "type": "n8n-nodes-base.httpRequest",

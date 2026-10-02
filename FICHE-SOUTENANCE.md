@@ -82,15 +82,18 @@ Quand tu poses une question : on la transforme en vecteur, on retrouve les passa
 ### Comment on l'a fait (pipeline explicite, nœud par nœud)
 Chaque étape est un **nœud visible** (pas de « sous-nœud » boîte noire), dans cet ordre :
 1. **Interface chat** avec **mémoire** (table `chat_turns` en SQL) → questions de suivi ("et pour l'option américaine ?").
-2. **Embedding de la question** (HTTP → Gemini) : la question devient un vecteur, avec **le même modèle** qu'à l'indexation.
-3. **Recherche hybride** — deux requêtes SQL combinées :
+2. **Reformulation de la question** (Claude) : on réécrit la question en **une requête de recherche autonome en anglais**, en s'appuyant sur l'historique (voir encadré plus bas).
+3. **Embedding de la requête** (HTTP → Gemini) : la requête reformulée devient un vecteur, avec **le même modèle** qu'à l'indexation.
+4. **Recherche hybride** — deux requêtes SQL combinées :
    - **Sémantique** (vecteurs, opérateur `<=>`) : trouve par le sens → 20 passages.
    - **Mots-clés** (full-text Postgres) : trouve les termes exacts (noms propres, sigles, formules nommées) → 8 passages.
-4. **Fusion + dédoublonnage** des passages (nœud Code).
-5. **Reranking (HTTP → Cohere)** : un modèle spécialisé **reclasse** ces candidats par pertinence et ne garde que les **5 meilleurs**.
-6. **Augmentation** (nœud Code) : on **construit à la main le prompt** = consigne système + historique + les 5 extraits (avec leur page) + la question.
-7. **Génération (nœud Claude)** : lit ce prompt et rédige la réponse **en citant la page**, sans inventer.
-8. **Sauvegarde** de l'échange dans `chat_turns` (SQL) pour la mémoire.
+5. **Fusion + dédoublonnage** des passages (nœud Code).
+6. **Reranking (HTTP → Cohere)** : un modèle spécialisé **reclasse** ces candidats par pertinence et ne garde que les **5 meilleurs**.
+7. **Augmentation** (nœud Code) : on **construit à la main le prompt** = consigne système + historique + les 5 extraits (avec leur page) + la question.
+8. **Génération (nœud Claude)** : lit ce prompt et rédige la réponse **en citant la page**, sans inventer.
+9. **Sauvegarde** de l'échange dans `chat_turns` (SQL) pour la mémoire.
+
+**Pourquoi reformuler la question ? (étape 2)** Le livre est en **anglais**, les questions en **français**. On demande à Claude de transformer la question en une **requête de recherche autonome en anglais** avant de chercher. Deux gains : (1) la recherche (vectorielle *et* mots-clés) tombe sur les bons passages du livre anglais ; (2) les **questions de suivi** sont résolues — "et pour l'américaine ?" devient *"American option early exercise"* grâce à l'historique, sinon la recherche seule n'y comprendrait rien. C'est un exemple concret d'étape qu'on a pu **ajouter facilement** grâce au pipeline explicite.
 
 **Pourquoi un pipeline explicite ?** À la demande du jury, on a supprimé le nœud « AI Agent » (qui faisait recherche + génération en boîte noire). Avantage : on **voit et contrôle chaque étape**, et on peut en **ajouter** (ex. un garde-fou "absent du livre", une traduction FR→EN de la question) à l'endroit voulu. L'indexation, elle, garde ses sous-nœuds car ils garantissent automatiquement le numéro de page (voir plus bas).
 
@@ -125,6 +128,7 @@ C'est le cœur du RAG : une réponse **vérifiable** et **fiable**. On l'a test�
 | Base vectorielle | Postgres + pgvector (Supabase) | recherche de proximité + gratuit |
 | Passages récupérés | 20 | large filet pour ne rien rater |
 | Passages gardés après rerank | 5 | précision : seuls les meilleurs vont au LLM |
+| Reformulation de requête | Claude → requête EN autonome | FR→EN pour le livre anglais + résout les questions de suivi |
 | Recherche | hybride (sémantique + mots-clés) | couvre sens ET termes exacts |
 | LLM de réponse | Claude `claude-sonnet-5` | synthèse + gratuit (crédits n8n) |
 | Mémoire | Table SQL `chat_turns` | questions de suivi |

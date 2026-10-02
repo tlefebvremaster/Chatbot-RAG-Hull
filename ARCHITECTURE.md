@@ -21,11 +21,22 @@ WORKFLOW 1 — Indexation (une seule fois, manuel)
                                        (text + embedding 3072 + metadata.loc.pageNumber)
 
 WORKFLOW 2 — Question / Réponse (chaîne explicite, à chaque message)
-┌───────────────┐   ┌──────────────────┐   ┌──────────────────────────┐
-│ Chat Trigger   │──▶│ Préparer entrée    │──▶│ Embedding question (Gemini)│  HTTP
-│ (public, mémo) │   │ (Set: question,    │   │  → vecteur 3072           │
-└───────────────┘   │  session_id)       │   └───────────┬──────────────┘
-                     └──────────────────┘               ▼
+┌───────────────┐   ┌──────────────────┐   ┌─────────────────────────┐
+│ Chat Trigger   │──▶│ Préparer entrée    │──▶│ Historique (reformulation)│ (Postgres: agrège l'historique)
+│ (public, mémo) │   │ (Set: question,    │   └───────────┬─────────────┘
+└───────────────┘   │  session_id)       │               ▼
+                     └──────────────────┘   ┌─────────────────────────┐
+                                             │ Reformuler la question   │ Claude → requête EN autonome
+                                             └───────────┬─────────────┘  (résout les questions de suivi)
+                                                         ▼
+                                             ┌─────────────────────────┐
+                                             │ Requete de recherche     │ (Set: search_query + question d'origine)
+                                             └───────────┬─────────────┘
+                                                         ▼
+                                             ┌──────────────────────────┐
+                                             │ Embedding question (Gemini)│  HTTP → vecteur 3072
+                                             └───────────┬──────────────┘
+                                                         ▼
                                               ┌──────────────────┐
                                               │ Vecteur vers SQL  │ (Code)
                                               └────────┬──────────┘
@@ -76,6 +87,7 @@ WORKFLOW 2 — Question / Réponse (chaîne explicite, à chaque message)
 | Exigence (cahier des charges) | Choix technique | Pourquoi |
 |---|---|---|
 | Interface de chat avec mémoire | Nœud **Chat Trigger** (`public`, `responseMode: lastNode`) + table mémoire `chat_turns` lue/écrite en SQL | Permet les questions de suivi ("et pour l'option américaine ?") sans dépendre d'un sous-nœud de mémoire |
+| Qualité du retrieval (livre EN, questions FR) | Étape de **reformulation de requête** (nœud Claude) : réécrit la question en une requête de recherche autonome en **anglais**, en s'appuyant sur l'historique | FR→EN améliore la recherche vectorielle ET mots-clés sur un livre anglais ; résout les questions de suivi ("et pour l'américaine ?") avant la recherche |
 | Suppression des « sous-nœuds » (demande du jury) | Chaîne **explicite** : HTTP (embedding, rerank), Postgres (recherche, mémoire), Code (fusion, augmentation), nœud Anthropic | Chaque étape est visible et modifiable ; on peut insérer une étape (garde-fou, traduction…) n'importe où |
 | Indexation une seule fois, ce livre uniquement | Workflow 1 séparé, déclenché par un **formulaire n8n** (champ fichier) | Le formulaire est le moyen simple d'envoyer le PDF à n8n cloud (pas d'accès au disque local) |
 | Réponse = texte libre + citation chapitre/page | Prompt système explicite (nœud Code *Construire prompt augmente*) + découpage **par page** (`splitPages: true`) à l'indexation | Chaque passage retrouvé porte son `metadata.loc.pageNumber`, injecté dans le contexte sous la forme `[page X]` et cité par Claude |
@@ -100,16 +112,21 @@ WORKFLOW 2 — Question / Réponse (chaîne explicite, à chaque message)
 ### Workflow 2 — Question / Réponse (`rag-chatbot-explicite.json`)
 1. **Chat RAG Hull** (Chat Trigger) reçoit le message et l'identifiant de session.
 2. **Préparer entrée** (Set) extrait `question` et `session_id`.
-3. **Embedding question (Gemini)** (HTTP POST) transforme la question en vecteur 3072 — *même modèle que l'indexation*, condition pour que les vecteurs soient comparables.
-4. **Vecteur vers SQL** (Code) formate le vecteur (`[v1,v2,…]`) et nettoie les mots-clés.
-5. **Recherche vectorielle** (Postgres) : `ORDER BY embedding <=> vec` → 20 passages par le sens. **Recherche mots-cles** (Postgres) : `to_tsvector @@ plainto_tsquery` → 8 passages par termes exacts.
-6. **Fusionner resultats** (Merge) + **Agreger passages** (Code, dédoublonnage par texte).
-7. **Rerank (Cohere)** (HTTP POST, `rerank-v3.5`, `top_n: 5`) reclasse les candidats par pertinence réelle.
-8. **Top passages** (Code) reconstruit les 5 meilleurs passages avec leur page → bloc de contexte `[page X] …`.
-9. **Lire historique** (Postgres) récupère les 5 derniers échanges de la session (`alwaysOutputData: true`).
-10. **Construire prompt augmente** (Code) assemble le message système (réponds en français, uniquement d'après les extraits, cite la page, n'invente pas) + historique + extraits + question. **C'est l'étape d'augmentation.**
-11. **Generer reponse** (Anthropic, `claude-sonnet-5`) rédige la réponse sourcée.
-12. **Sauver historique** (Postgres INSERT, dollar-quoting `$q$…$q$` / `$a$…$a$` pour gérer les virgules/apostrophes) + **Reponse (sortie chat)** (Set) renvoie la réponse.
+3. **Historique (reformulation)** (Postgres) agrège les 5 derniers échanges de la session en une seule ligne `history` (toujours une ligne, même vide → la chaîne ne s'interrompt jamais).
+4. **Reformuler la question** (Claude) réécrit la question en **une requête de recherche autonome en anglais**, en résolvant les références à l'historique (ex. "et pour l'américaine ?" → "American option early exercise"). *C'est l'étape de query rewriting.*
+5. **Requete de recherche** (Set) expose `search_query` (la requête reformulée) tout en conservant la `question` d'origine (en français, pour la réponse finale).
+6. **Embedding question (Gemini)** (HTTP POST) transforme la `search_query` en vecteur 3072 — *même modèle que l'indexation*, condition pour que les vecteurs soient comparables.
+7. **Vecteur vers SQL** (Code) formate le vecteur (`[v1,v2,…]`) et nettoie les mots-clés (à partir de la `search_query`).
+8. **Recherche vectorielle** (Postgres) : `ORDER BY embedding <=> vec` → 20 passages par le sens. **Recherche mots-cles** (Postgres) : `to_tsvector @@ plainto_tsquery` → 8 passages par termes exacts.
+9. **Fusionner resultats** (Merge) + **Agreger passages** (Code, dédoublonnage par texte).
+10. **Rerank (Cohere)** (HTTP POST, `rerank-v3.5`, `top_n: 5`) reclasse les candidats par pertinence réelle (query = `search_query`).
+11. **Top passages** (Code) reconstruit les 5 meilleurs passages avec leur page → bloc de contexte `[page X] …`.
+12. **Lire historique** (Postgres) récupère les 5 derniers échanges de la session (`alwaysOutputData: true`), pour le prompt final.
+13. **Construire prompt augmente** (Code) assemble le message système (réponds en français, uniquement d'après les extraits, cite la page, n'invente pas) + historique + extraits + question d'origine. **C'est l'étape d'augmentation.**
+14. **Generer reponse** (Anthropic, `claude-sonnet-5`) rédige la réponse sourcée.
+15. **Sauver historique** (Postgres INSERT, dollar-quoting `$q$…$q$` / `$a$…$a$` pour gérer les virgules/apostrophes) + **Reponse (sortie chat)** (Set) renvoie la réponse.
+
+> **Note :** l'historique est lu à deux endroits — tôt (étape 3) pour la reformulation, et plus tard (étape 12) pour le prompt final. Deux petites lectures SQL indépendantes, qui gardent chaque étape simple et isolée.
 
 ## 4. Modèle de données
 

@@ -19,7 +19,11 @@ Construit avec **n8n** (orchestration), **Supabase / Postgres + pgvector** (base
 Chat (question + mémoire de session)
    │
    ▼
-Embedding de la question ........ HTTP → Google Gemini (gemini-embedding-001, 3072 dim)
+Reformulation de la question ..... Claude → requête de recherche autonome en ANGLAIS
+   (résout les questions de suivi via l'historique ; FR→EN pour matcher le livre)
+   │
+   ▼
+Embedding de la requête .......... HTTP → Google Gemini (gemini-embedding-001, 3072 dim)
    │
    ▼
 Recherche HYBRIDE sur Postgres
@@ -46,6 +50,7 @@ Réponse (+ sauvegarde de l'échange dans chat_turns)
 
 | Paramètre | Valeur | Pourquoi |
 |---|---|---|
+| Reformulation de requête | Claude → requête EN autonome | FR→EN pour matcher le livre anglais + résout les questions de suivi |
 | Taille de chunk | 1000 caractères | ~1 paragraphe : assez de contexte, assez précis |
 | Chevauchement (overlap) | 200 (20 %) | évite de couper une idée à la frontière |
 | Découpage | récursif + par page | coupe aux frontières naturelles + garde le n° de page |
